@@ -1,0 +1,21 @@
+{
+  "name": "jrmc",
+  "version": "0.0.1",
+  "description": "J River Media Center Interface",
+  "main": "jrmc.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "npm",
+    "module"
+  ],
+  "dependencies" :
+  	{
+  	 "http-proxy": "",
+  	 "superagent": "",
+  	 "xml2js": ""
+  	},
+  "author": "Bill Flynn",
+  "license": "BSD-2-Clause"
+}
