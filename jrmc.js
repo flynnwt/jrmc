@@ -24,7 +24,6 @@
  zone: 0,                                              // zone to poll
  myPort: 1111,                                         // server port
  jrmcServer: '192.168.0.2:52199',                      // jrmc server:port
- myFolder: '/',                                        // proxy to/through internal (xxx/status, xxx/alive)
  jrmcFolder: '/jrmc',                                  // this/xxx routes to jrmc/mcws/v1/xxx
  pollExistsInterval: 60 * 1000,                        // 'running' polling ms
  pollPlayingThresholdStart: 5 * 1000,                  // ms at beginning of song to poll fast
