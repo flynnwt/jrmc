@@ -1,39 +1,42 @@
 'use strict';
 
-// Reverse proxy and monitor/server for JRMC
+// Server/monitor for JRMC
 //
+
 // Server:
-//  1. pass directly to/from jrmc
-//  2. pass directly to jrmc, convert xml response, return json or jsonp
-//  3. process internally, return json or jsonp
-//  json or jsonp is based on existence of callback=xxx param
-//  ../alive OR ../alive?callback=angular_cb OR ../jrmc/alive
+//  1. pass request to jrmc, return response converted to json or jsonp
+//  2. process internally (monitored status, etc.), return json or jsonp
 //
 // Monitor:
 //  1. poll, gather, format useful jrmc info
+//
+// Events emitted:
+//  log, logD, logI, logE, error
+//  request, socketIOReady
+//  stateChange, status, jrmcExists, jrmcPlayState, info, playlist, playlists
+//  startTrack, endTrack, changeTrack, playlistChange, zoneChange, imageChange
+
 
 /*
  var config = {
 
-  quiet: false,
-  zone: 0,                                              // zone to poll
-  myPaths: ['localhost', 'name', '192.168.0.1'],        // server names
-  myPort: 1111,                                         // server port
-  jrmcProxyPort: 5000,                                  // internal port
-  jrmcServer: '192.168.0.2:52199',                      // jrmc server:port
-  myFolder: '/',                                        // proxy to/through internal (xxx/status, xxx/alive)
-  jrmcFolder: '/jrmc/',                                 // direct to/from jrmc/mcws/v1/
-  pollExistsInterval: 60 * 1000,                        // 'running' polling ms
-  pollPlayingThresholdStart: 5 * 1000,                  // ms at beginning of song to poll fast
-  pollPlayingThresholdEnd: 20 * 1000,                   // ms at end of song to poll fast
-  pollSlowPlayingInterval: 10 * 1000,                   // 'playing' slow polling ms
-  pollFastPlayingInterval: 0.5 * 1000,                  // 'playing' fast polling ms
-  pollPlaylistInterval: 60 * 1000,                      // playlist polling ms
-  // fields kept in playlist info (null for all)
-  playlistFields: ['Key', 'Artist', 'Album', 'Name', 'Genre', 'Keywords', 'Rating', 'Number Plays']
+ quiet: false,
+ zone: 0,                                              // zone to poll
+ myPort: 1111,                                         // server port
+ jrmcServer: '192.168.0.2:52199',                      // jrmc server:port
+ myFolder: '/',                                        // proxy to/through internal (xxx/status, xxx/alive)
+ jrmcFolder: '/jrmc',                                  // this/xxx routes to jrmc/mcws/v1/xxx
+ pollExistsInterval: 60 * 1000,                        // 'running' polling ms
+ pollPlayingThresholdStart: 5 * 1000,                  // ms at beginning of song to poll fast
+ pollPlayingThresholdEnd: 20 * 1000,                   // ms at end of song to poll fast
+ pollSlowPlayingInterval: 10 * 1000,                   // 'playing' slow polling ms
+ pollFastPlayingInterval: 0.5 * 1000,                  // 'playing' fast polling ms
+ pollPlaylistInterval: 60 * 1000,                      // playlist polling ms
+ // fields kept in playlist info (null for all)
+ playlistFields: ['Key', 'Artist', 'Album', 'Name', 'Genre', 'Keywords', 'Rating', 'Number Plays']
  };
 
-*/
+ */
 
 var util = require('util'),
     httpProxy = require('http-proxy'),
@@ -42,7 +45,8 @@ var util = require('util'),
     jrmcPoller = require('superagent'),
     xml2js = require('xml2js'),
     url = require('url'),
-    events = require('events');
+    events = require('events'),
+    socketio = require('socket.io');
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -50,7 +54,7 @@ var $ = new events.EventEmitter();
 
 var jrmcServerPath;
 var config = {};
-var jrmc = {};
+var jrmc = {};      // see init() for properties
 
 // create xml parser; make the attrs a property of parent, and don't make single-item arrays
 var parser = new xml2js.Parser({mergeAttrs: true, explicitArray: false});
@@ -79,63 +83,33 @@ var log = {
   }
 };
 
-///////////////////////////////////////////////////////////////////////////////
-// Proxy Server
+var server, io;
 
 function startServer() {
-  var i,
-      proxyOptions = {
-        router: {}
-      };
-
-// order is important if one is subfolder of other; just check length
-  if (config.myFolder.length > config.jrmcFolder.length) {
-    log.i('Path to internal: ' + config.myFolder);
-    log.i('Path to jrmc: ' + config.jrmcFolder);
-    for (i = 0; i < config.myPaths.length; i++) {
-      log.i('Server: ' + config.myPaths[i]);
-      proxyOptions.router[config.myPaths[i] + config.myFolder] = config.myPaths[i] + ':' + config.jrmcProxyPort;
-      proxyOptions.router[config.myPaths[i] + config.jrmcFolder] = jrmcServerPath;
-    }
-  } else {
-    log.i('Path to jrmc: ' + config.jrmcFolder);
-    log.i('Path to internal: ' + config.myFolder);
-    for (i = 0; i < config.myPaths.length; i++) {
-      log.i('Server: ' + config.myPaths[i]);
-      proxyOptions.router[config.myPaths[i] + config.jrmcFolder] = jrmcServerPath;
-      proxyOptions.router[config.myPaths[i] + config.myFolder] = config.myPaths[i] + ':' + config.jrmcProxyPort;
-    }
-  }
-
-// intercept
-  function hi(req, res, next) {
-    $.emit('request', 'reqUrl=' + req.url);
-    next();
-  }
-
-// proxy: either pass to internal server or to jrmc
-  httpProxy.createServer(
-      hi,
-      proxyOptions
-  ).listen(config.myPort);
 
 ///////////////////////////////////////////////////////////////////////////////
 // Internal Server
+// /jrmcFolder  - return json/jsonp from jrmc
 // /,/status    - return status object
-// /info      - return info object
-// /image     - current file image
-// /playlist  - current playlist info
-// /playlists - all playlists info
+// /info        - return info object
+// /image       - current file image
+// /playlist    - current playlist info
+// /playlists   - all playlists info
 // /state?state=<next>  - return state, or set if param
 // /zone?zone=<n>       - return current zone, or set if param
 // /control?cmd=<play,pause,playpause,stop,prev,next>
 //               <volume&val=+x|-x|x>, +/- relative or absolute (0:100%)
 //               <position&val=+x|-x|x>, +/- relative or absolute (ms)
 //               <rating&val=x> (0=clear, 1:5)
+//               <playlist&id=xx&mode=replace|add|insert>           xx=playlist id
+//               <playdoctort&id=xx&mode=replace|add|insert>        xx=playlist id
 // <others>   - return json/jsonp from jrmc
 
   http.createServer(function(req, res) {
-    var cb, reqUrl, urlParts, query, jrmcUrl, result, contentType, jsonp, o, value, params, urlStart;
+    var cb, reqUrl, urlParts, query, jrmcUrl, result, contentType, jsonp,
+        o, value, params, folders, urlStart, urlRest, mode, id;
+
+    $.emit('request', req.url);
 
     // get rid of multiple '/' and trailing '/'
     reqUrl = req.url.replace(/\/+/g, '/').replace(/\/$/, '');
@@ -157,9 +131,18 @@ function startServer() {
     if (urlParts.pathname === '' || urlParts.pathname === '/') {
       urlParts.pathname = '/status';
     }
-    urlStart = '/' + urlParts.pathname.split('/')[1];
+    folders = urlParts.pathname.split('/');
+    urlStart = '/' + folders[1];
 
-    if (urlStart === '/status') {
+    if (config.jrmcFolder && urlStart === config.jrmcFolder ) {
+
+      urlRest = urlParts.pathname.split('/').slice(2).join('/');
+      jrmcUrl = jrmcServerPath + urlRest;
+      log.i('JRMC Server: reqUrl=' + reqUrl + '-> getUrl=' + jrmcUrl);
+      jrmcReq(req, res, jsonp, contentType, cb, jrmcUrl);
+      return;
+
+    } else if (urlStart === '/status') {
 
       log.i('Local Server: reqUrl=' + reqUrl);
       res.writeHead(200, {'Content-Type': contentType});
@@ -187,7 +170,9 @@ function startServer() {
 
       log.i('Local Server: reqUrl=' + reqUrl);
       res.writeHead(200, {'Content-Type': 'image'});
-      res.write(jrmc.image);
+      if (jrmc.image) {
+        res.write(jrmc.image);
+      }
       res.end();
       return;
 
@@ -258,26 +243,26 @@ function startServer() {
 
     } else if (urlStart === '/control') {
 
-      jrmcUrl = jrmcServerPath.replace(/\/$/, '') + '/playback/';
+      jrmcUrl = jrmcServerPath.replace(/\/$/, '') + '/playback/'; // default, but some don't use playback path!!
       value = query.cmd;
       if (value === 'volume') {
         value = query.val;
-        if (value.substring(0,1) === '+') {
-          params = 'level=' + (parseInt(value,10)/100) + '&relative=1';
-        } else if (value.substring(0,1) === '-') {
-          params = 'level=' + (parseInt(value,10)/100) + '&relative=1';
+        if (value.substring(0, 1) === '+') {
+          params = 'level=' + (parseInt(value, 10) / 100) + '&relative=1';
+        } else if (value.substring(0, 1) === '-') {
+          params = 'level=' + (parseInt(value, 10) / 100) + '&relative=1';
         } else {
-          params = 'level=' + (parseInt(value,10)/100);
+          params = 'level=' + (parseInt(value, 10) / 100);
         }
         jrmcUrl += 'volume?' + params + '&zone=' + jrmc.status.zone;
       } else if (value === 'position') {
         value = query.val;
-        if (value.substring(0,1) === '+') {
-          params = 'position=' + parseInt(value,10) + '&relative=1';
-        } else if (value.substring(0,1) === '-') {
-          params = 'position=' + (parseInt(value,10)*-1) + '&relative=-1';
+        if (value.substring(0, 1) === '+') {
+          params = 'position=' + parseInt(value, 10) + '&relative=1';
+        } else if (value.substring(0, 1) === '-') {
+          params = 'position=' + (parseInt(value, 10) * -1) + '&relative=-1';
         } else {
-          params = 'position=' + parseInt(value,10);
+          params = 'position=' + parseInt(value, 10);
         }
         jrmcUrl += 'position?' + params + '&zone=' + jrmc.status.zone;
       } else if (value === 'pause') {
@@ -286,6 +271,28 @@ function startServer() {
         jrmcUrl += 'pause?state=0' + '&zone=' + jrmc.status.zone;
       } else if (value === 'prev') {
         jrmcUrl += 'previous?zone=' + jrmc.status.zone;
+      } else if (value === 'playlist') {
+        id = query.id;
+        mode = query.mode;
+        if (mode === 'add') {
+          mode = '&playmode=add';
+        } else if (mode === 'insert') {
+          mode = '&playmode=nexttoplay';
+        } else {
+          mode = '';
+        }
+        jrmcUrl = jrmcServerPath.replace(/\/$/, '') + '/playlist/files?action=play&playlist=' + id + mode;
+      } else if (value === 'playdoctor') {
+        id = query.id;
+        mode = query.mode;
+        if (mode === 'add') {
+          mode = '&playmode=add';
+        } else if (mode === 'insert') {
+          mode = '&playmode=nexttoplay';
+        } else {
+          mode = '';
+        }
+        jrmcUrl = jrmcServerPath.replace(/\/$/, '') + '/playlist/files?playdoctor=1&action=play&playlist=' + id + mode;
       } else if (value === 'rating') {
         value = query.val;
         jrmcUrl = jrmcServerPath.replace(/\/$/, '') + '/control/mcc?command=10023&parameter=' + value;
@@ -296,9 +303,9 @@ function startServer() {
       log.i('Local Server: reqUrl=' + reqUrl + '-> getUrl=' + jrmcUrl);
       jrmcRequest.get(jrmcUrl, function(err, data) {
 
-        if (err || data.status !== 200) {
+        if (err || data.status !== 200 || !data.text) {
           res.writeHead(404, {'Content-Type': 'text/html'});
-          result = 'Error: ' + err + ' Status:' + data.status;
+          result = 'Error: ' + err + ' Status:' + (data ? data.status : 'undefined');
           log.e(result);
           res.write(result);
           res.end();
@@ -346,38 +353,49 @@ function startServer() {
        */
     } else {
 
-      log.i('Local Server: reqUrl=' + reqUrl + '-> getUrl=' + jrmcUrl);
-      jrmcRequest.get(jrmcUrl, function(err, data) {
+      log.i('JRMC Server: reqUrl=' + reqUrl + '-> getUrl=' + jrmcUrl);
+      jrmcReq(req, res, jsonp, contentType, cb, jrmcUrl);
+      return;
 
-        if (err || data.status !== 200) {
-          res.writeHead(404, {'Content-Type': 'text/html'});
-          result = 'Error: ' + err + ' Status:' + data.status;
-          log.e(result);
-          res.write(result);
-          res.end();
-          return;
-        }
-
-        parser.parseString(data.text, function(err, result) {
-          if (err) {
-            res.writeHead(200, {'Content-Type': 'text/html'});
-            result = 'Parsing error!\n' + err;
-            log.e(result);
-            res.write(result);
-          } else {
-            res.writeHead(200, {'Content-Type': contentType});
-            if (jsonp) {
-              res.write(cb + '(' + JSON.stringify(result) + ');');
-            } else {
-              res.write(JSON.stringify(result));
-            }
-          }
-          res.end();
-        });
-
-      });
     }
-  }).listen(config.jrmcProxyPort);
+  }).listen(config.myPort);
+
+  socketIO();
+
+}
+
+function jrmcReq(req, res, jsonp, contentType, cb, jrmcUrl) {
+
+  jrmcRequest.get(jrmcUrl, function(err, data) {
+    var result;
+
+    if (err || data.status !== 200) {
+      res.writeHead(404, {'Content-Type': 'text/html'});
+      result = 'Error: ' + err + ' Status:' + (data ? data.status : 'undefined');
+      log.e(result);
+      res.write(result);
+      res.end();
+      return;
+    }
+
+    parser.parseString(data.text, function(err, result) {
+      if (err) {
+        res.writeHead(200, {'Content-Type': 'text/html'});
+        result = 'Parsing error!\n' + err;
+        log.e(result);
+        res.write(result);
+      } else {
+        res.writeHead(200, {'Content-Type': contentType});
+        if (jsonp) {
+          res.write(cb + '(' + JSON.stringify(result) + ');');
+        } else {
+          res.write(JSON.stringify(result));
+        }
+      }
+      res.end();
+    });
+
+  });
 
 }
 
@@ -409,6 +427,30 @@ function parseResponse(items, properties, lowerCaseFirst) {
     }
   }
   return out;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Socket.io Interface
+
+function socketIO() {
+
+  //if (config.socketIOPort) {
+  io = socketio.listen(server);
+  $.emit('socketIOReady', io);
+  io.set('log level', 1); // no debug messages
+
+  io.sockets.on('connection', function(socket) {
+    socket.emit('connect', { hello: 'world' });
+    /*
+     socket.on('command', function(data) {
+     doCommand(data);
+     });
+     socket.on('status', function(data) {
+     socket.emit('status', db.data);
+     });
+     */
+  });
+
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -548,7 +590,7 @@ function jrmcExists() {
   jrmcPoller.get(jrmcServerPath + jrmc.checkAlive, function(err, data) {
 
     if (err || data.status !== 200) {
-      setState('error', me + ' error: ' + err + '/' + data.status);
+      setState('error', me + ' error: ' + err + '/' + (data ? data.status : 'undefined'));
       clearTimeout(jrmc.timerActive);
     } else {
 
@@ -598,7 +640,7 @@ function jrmcActive() {
     jrmcPoller.get(url, function(err, data) {
 
       if (err || data.status !== 200) {
-        setState('error', me + ' error: ' + err + '/' + data.status);
+        setState('error', me + ' error: ' + err + '/' + (data ? data.status : 'undefined'));
       } else {
         parser.parseString(data.text, function(err, result) {
           var response, parsed;
@@ -667,6 +709,13 @@ function logStatus() {
   }
   log.i(text);
   $.emit('status', text);
+
+  if (jrmc.info.status === 'Playing') {
+    io.sockets.emit('status', jrmc.status);
+    io.sockets.emit('info', jrmc.info);
+    io.sockets.emit('playlist', jrmc.playlist);
+    io.sockets.emit('playlists', jrmc.playlists);
+  }
 }
 
 function getImage(key) {
@@ -722,7 +771,6 @@ function changeTrack(next) {
   getImage(next.fileKey);
   checkPlaylist();
 }
-
 
 function checkPlaylist() {
   var url,

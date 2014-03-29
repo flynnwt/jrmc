@@ -3,12 +3,10 @@
 var config = {
   quiet: false,
   zone: 0,                                              // zone to poll
-  myPaths: ['localhost', 'name', '192.168.0.1'],        // server names
   myPort: 1111,                                         // server port
-  jrmcProxyPort: 5000,                                  // internal port
   jrmcServer: '192.168.0.2:52199',                      // jrmc server:port
   myFolder: '/',                                        // proxy to/through internal (xxx/status, xxx/alive)
-  jrmcFolder: '/jrmc/',                                 // direct to/from jrmc/mcws/v1/
+  jrmcFolder: '/jrmc',                                  // route this/xxx to jrmc/mcws/v1/xxx; ignore if null
   pollExistsInterval: 60 * 1000,                        // 'running' polling ms
   pollPlayingThresholdStart: 5 * 1000,                  // ms at beginning of song to poll fast
   pollPlayingThresholdEnd: 20 * 1000,                   // ms at end of song to poll fast

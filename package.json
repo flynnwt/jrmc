@@ -12,7 +12,7 @@
   ],
   "dependencies" :
   	{
-  	 "http-proxy": "",
+  	 "http-proxy": "1.0.3",
   	 "superagent": "",
   	 "xml2js": ""
   	},
